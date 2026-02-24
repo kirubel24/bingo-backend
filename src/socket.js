@@ -182,26 +182,11 @@ export const initSocket = (io) => {
       }
     });
 
-    socket.on("disconnect", async () => {
+    socket.on("disconnect", () => {
       console.log(`🔴 Client disconnected: ${socket.id}`);
       try {
-        const u = getUserFromSocket(socket);
-        const userId = u?.id;
         const games = getAllGames();
         for (const [gid, g] of Object.entries(games)) {
-          // Check if user has a pending stake that needs refunding on disconnect
-          if (userId) {
-            const isParticipant = g.settlementParticipants && g.settlementParticipants.some(p => String(p.player.id) === String(userId));
-            // Only refund if they are NOT a participant in an active round (spectators/lobby waiters)
-            if (!isParticipant) {
-              // We don't have direct access to stakeAmount here easily without a DB call, 
-              // but we can trigger the refund logic which checks for pending transactions.
-              // For simplicity, we assume the frontend 'backToStake' logic handles it for active sessions,
-              // but for unexpected disconnects, we should ensure the DB transaction is cleaned up.
-              // The applyStakeRefund controller already handles the logic of checking if a refund is valid.
-            }
-          }
-
           // Remove from current round players
           const idx = g.players.findIndex((p) => p?.player?.socketId === socket.id);
           if (idx >= 0) {
@@ -332,7 +317,6 @@ const resetToLobby = async (io, gameId) => {
 
   game.calledNumbers = [];
   game.started = false;
-  game.settlementParticipants = [];
   game.stake = 0;
 
   if (game.timer) {
@@ -397,58 +381,6 @@ const startLobbyCountdown = (io, gameId) => {
       game.timer = null;
       startGame(gameId);
       const g = getGame(gameId);
-      
-      // AUTHORITATIVE STAKE COMMIT: Deduct balance only for frozen settlementParticipants now
-      (async () => {
-        if (g && g.settlementParticipants && g.settlementParticipants.length > 0) {
-          const stakeAmount = Number(g.stake || 0);
-          if (stakeAmount > 0) {
-            for (const p of g.settlementParticipants) {
-              const userId = p.player.id;
-              // Check for the pending stake transaction
-              try {
-                const [pending] = await pool.query(
-                  'SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status="pending" ORDER BY created_at DESC LIMIT 1',
-                  [userId]
-                );
-                
-                if (pending.length > 0) {
-                  const conn = await pool.getConnection();
-                  try {
-                    await conn.beginTransaction();
-                    // Lock wallet
-                    const [wallet] = await conn.query('SELECT main_balance FROM wallets WHERE user_id=? FOR UPDATE', [userId]);
-                    const currentBal = wallet.length ? Number(wallet[0].main_balance) : 0;
-                    
-                    if (currentBal >= stakeAmount) {
-                      // Deduct
-                      await conn.query('UPDATE wallets SET main_balance = main_balance - ? WHERE user_id = ?', [stakeAmount, userId]);
-                      // Mark transaction as success
-                      await conn.query('UPDATE transactions SET status="success" WHERE id=?', [pending[0].id]);
-                      await conn.commit();
-                      console.log(`✅ Committed stake for user ${userId} in room ${gameId}`);
-                    } else {
-                      // Insufficient balance at the last second? Reject them from this round.
-                      await conn.rollback();
-                      console.log(`❌ Insufficient balance for user ${userId} at start; skipping commit.`);
-                      // Optionally we could remove them from g.settlementParticipants here, 
-                      // but they already have a card. For now, they just don't pay.
-                    }
-                  } catch (err) {
-                    await conn.rollback();
-                    console.error(`❌ Error committing stake for user ${userId}:`, err);
-                  } finally {
-                    conn.release();
-                  }
-                }
-              } catch (err) {
-                console.error(`❌ Error finding pending stake for user ${userId}:`, err);
-              }
-            }
-          }
-        }
-      })();
-
       const participantUserIds = (g && g.settlementParticipants || []).map((p) => p.player.id);
       io.to(gameId).emit("game_start", { participantUserIds });
       io.except(gameId).emit("game_started_notification", { gameId });
