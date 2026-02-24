@@ -237,7 +237,11 @@ export const applyStakeRefund = async (req, res) => {
         const { getGame } = await import('../services/gameService.js')
         const g = getGame(String(room_id))
         if (g && g.started) {
-          return res.status(409).json({ success: false, message: 'Game already started' })
+          // Check if user was a participant in the current round
+          const isParticipant = g.settlementParticipants && g.settlementParticipants.some(p => String(p.player.id) === String(userId));
+          if (isParticipant) {
+            return res.status(409).json({ success: false, message: 'Game already started and you are a participant' })
+          }
         }
       } catch {}
     }
