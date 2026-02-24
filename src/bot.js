@@ -6,7 +6,9 @@ import dotenv from 'dotenv';
 import { pool } from './db.js';
 import { registerTelegramUser, loginTelegramUser } from './services/userService.js';
 
-dotenv.config();
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+}
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 bot.use(session());
@@ -47,24 +49,38 @@ const resetWithdrawFlow = (ctx) => {
   delete ctx.session.withdrawMethod;
 };
 
-// Main Menu Keyboard
+// Menu button texts – if user sends these while in a flow, cancel flow and let hears handle them
+const MENU_BUTTON_TEXTS = new Set([
+  '🎮 ጨዋታ ጀምር',
+  '💰 ሂሳብ',
+  '🏆 መሪዎች ዝርዝር',
+  '💳 ተቀማጭ',
+  '💸 ውጣ',
+  '👥 ወዳጆችን ጋብዝ',
+  'ℹ️ መመሪያ',
+  '🏁 የጨዋታ አቀማመጦች',
+  '📞 ድጋፍ'
+]);
+
+// Main Menu Keyboard - persistent so it stays visible
 const getMainKeyboard = (userId) => {
   const url = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const baseUrl = url.replace(/\/+$/, '');
   return Markup.keyboard([
-    [Markup.button.webApp('🎮 ቢንጎ', `${url}/?tg_user_id=${userId}`), '🎮 ጨዋታ ጀምር'],
-    ['💰 ሂሳብ', '🏆 የመሪዎች ዝርዝር'],
-    ['💳 ገንዘብ አስገባ', '💸 ገንዘብ አውጣ'],
-    ['👥 ወዳጆችን ጋብዝ'],
-    ['ℹ️ መመሪያ', '🏁 የጨዋታ ዘዴዎች'],
-    ['📞 ድጋፍ']
-  ]).resize();
+    [Markup.button.webApp('🎮 ቢንጎ', `${baseUrl}/?tg_user_id=${userId}&skip_login=true`), Markup.button.text('🎮 ጨዋታ ጀምር')],
+    [Markup.button.text('💰 ሂሳብ'), Markup.button.text('🏆 መሪዎች ዝርዝር')],
+    [Markup.button.text('💳 ተቀማጭ'), Markup.button.text('💸 ውጣ')],
+    [Markup.button.text('👥 ወዳጆችን ጋብዝ')],
+    [Markup.button.text('ℹ️ መመሪያ'), Markup.button.text('🏁 የጨዋታ አቀማመጦች')],
+    [Markup.button.text('📞 ድጋፍ')]
+  ], { resize_keyboard: true, is_persistent: true });
 };
 
 // Commands
 bot.start(async (ctx) => {
   try {
     const telegramId = String(ctx.from.id);
-    const webAppUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?tg_user_id=${telegramId}`;
+    const webAppUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?tg_user_id=${telegramId}&skip_login=true`;
     
     // Set the Menu Button for this user
     await ctx.setChatMenuButton({
@@ -73,78 +89,79 @@ bot.start(async (ctx) => {
       web_app: { url: webAppUrl }
     });
 
-    ctx.reply(`እንኳን ወደ ቢንጎ በደህና መጡ! 🎮\n${ctx.from.first_name} ተጫውተው ያሸንፋ!`, getMainKeyboard(telegramId));
+    ctx.reply(`እንኳን ወደ ቢንጎ በደህና መጡ! 🎮\n${ctx.from.first_name} ሆይ፣ እንጫወት እና እንሸማማ!`, getMainKeyboard(telegramId));
   } catch (error) {
     console.error('Error in start command:', error);
-    ctx.reply(`እንኳን ወደ ቢንጎ በደህና መጡ! 🎮\n${ctx.from.first_name} ተጫውተው ያሸንፋ!`);
+    ctx.reply(`እንኳን ወደ ቢንጎ በደህና መጡ! 🎮\n${ctx.from.first_name} ሆይ፣ እንጫወት እና እንሸማማ!`, getMainKeyboard(ctx.from.id));
   }
 });
 
 bot.command('register', async (ctx) => {
-  const telegramId = String(ctx.from.id);
-  const username = ctx.from.username || `user_${telegramId}`;
-  ctx.reply('በቴሌግራም መለያዎ በኩል አስቀድሞ ተመዝግበዋል።');
+  ctx.reply('ከቴሌግራም መለያህ በኩል አስቀድሞ ተመዝግበሃል።', getMainKeyboard(ctx.from.id));
 });
 
 bot.command('balance', async (ctx) => {
   try {
-    if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገቡ።');
+    if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
     const [rows] = await pool.query('SELECT main_balance, bonus_balance FROM wallets WHERE user_id = ?', [ctx.state.user.id]);
     const { main_balance, bonus_balance } = rows[0] || { main_balance: 0, bonus_balance: 0 };
-    ctx.reply(`💰  ሂሳብዎ:\nዋና: ${main_balance} ብር\nቦነስ: ${bonus_balance} ብር`);
+    ctx.reply(`💰 የአንተ ሂሳብ:\nዋና: ${main_balance} ብር\nቦነስ: ${bonus_balance} ብር`, getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('ሂሳብ ማመጣት አልተሳካም።');
+    ctx.reply('ሂሳብ ማመጣት አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
-bot.hears('💰 ሂሳብዎ', async (ctx) => {
+bot.hears('💰 ሂሳብ', async (ctx) => {
   try {
-    if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገቡ።');
+    if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
     const [rows] = await pool.query('SELECT main_balance, bonus_balance FROM wallets WHERE user_id = ?', [ctx.state.user.id]);
     const { main_balance, bonus_balance } = rows[0] || { main_balance: 0, bonus_balance: 0 };
-    ctx.reply(`💰 ሂሳብዎ:\nዋና: ${main_balance} ብር\nቦነስ: ${bonus_balance} ብር`);
+    ctx.reply(`💰 የአንተ ሂሳብ:\nዋና: ${main_balance} ብር\nቦነስ: ${bonus_balance} ብር`, getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('ሂሳብ ማመጣት አልተሳካም።');
+    ctx.reply('ሂሳብ ማመጣት አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
 bot.command('coin_balance', async (ctx) => {
   try {
-    if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገቡ።');
+    if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
     const [rows] = await pool.query('SELECT bonus_balance FROM wallets WHERE user_id = ?', [ctx.state.user.id]);
     const balance = rows[0]?.bonus_balance || 0;
-    ctx.reply(`🪙 የኮይን ሂሳብህ: ${balance} ኮይኖች`);
+    ctx.reply(`🪙 የኮይን ሂሳብህ: ${balance} ኮይኖች`, getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('የኮይን ሂሳብ ማመጣት አልተሳካም።');
+    ctx.reply('የኮይን ሂሳብ ማመጣት አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
-bot.command('play', (ctx) => {
-  ctx.reply('ለመጫወት ዋጋ ምረጥ፦', Markup.inlineKeyboard([
-    [Markup.button.callback('10 ብር', 'stake_10'), Markup.button.callback('25 ብር', 'stake_25')],
-    [Markup.button.callback('50 ብር', 'stake_50'), Markup.button.callback('100 ብር', 'stake_100')],
-    [Markup.button.webApp('🎮 ቢንጎ', `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?tg_user_id=${ctx.from.id}`)]
+bot.command('play', async (ctx) => {
+  await ctx.reply('ለመጫወት የሚገባህን ዋጋ ምረጥ፦', Markup.inlineKeyboard([
+    [Markup.button.callback('10 ብር', 'stake_10'), Markup.button.callback('20 ብር', 'stake_20')],
+    [Markup.button.callback('50 ብር', 'stake_50'), Markup.button.callback('100 ብር', 'stake_100')]
   ]));
+  await ctx.reply('ከላይ ዋጋ ምረጥ ወይም ከታች ቁልፎችን ተጠቀም።', getMainKeyboard(ctx.from.id));
 });
 
-bot.hears('🎮 ጨዋታ ጀምር', (ctx) => {
-  ctx.reply('ለመጫወት ዋጋ ምረጥ፦', Markup.inlineKeyboard([
-    [Markup.button.callback('10 ብር', 'stake_10'), Markup.button.callback('25 ብር', 'stake_25')],
-    [Markup.button.callback('50 ብር', 'stake_50'), Markup.button.callback('100 ብር', 'stake_100')],
-    [Markup.button.webApp('🎮 ቢንጎ', `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?tg_user_id=${ctx.from.id}`)]
+bot.hears('🎮 ጨዋታ ጀምር', async (ctx) => {
+  await ctx.reply('ለመጫወት የሚገባህን ዋጋ ምረጥ፦', Markup.inlineKeyboard([
+    [Markup.button.callback('10 ብር', 'stake_10'), Markup.button.callback('20 ብር', 'stake_20')],
+    [Markup.button.callback('50 ብር', 'stake_50'), Markup.button.callback('100 ብር', 'stake_100')]
   ]));
+  await ctx.reply('ከላይ ዋጋ ምረጥ ወይም ከታች ቁልፎችን ተጠቀም።', getMainKeyboard(ctx.from.id));
 });
 
 // Stake handling
 bot.action(/stake_(\d+)/, async (ctx) => {
   const amount = ctx.match[1];
   try {
-    const webAppUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?stake=${amount}&tg_user_id=${ctx.from.id}`;
-    ctx.reply(`የ ${amount} ብር መረጥህ! ወደ ጨዋታ ክፍል ለመግባት ከታች ያለውን ቁልፍ ተጫን።`, Markup.inlineKeyboard([
+    await ctx.answerCbQuery();
+    const baseUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    const webAppUrl = `${baseUrl}/?stake=${amount}&tg_user_id=${ctx.from.id}&skip_login=true&auto_select=true`;
+    await ctx.reply(`የ ${amount} ብር ዋጋ መድፈን መረጥህ! ወደ ጨዋታ ክፍል ለመግባት ከታች ካለው ቁልፍ ጫን።`, Markup.inlineKeyboard([
       [Markup.button.webApp('🎮 ቢንጎ', webAppUrl)]
     ]));
+    await ctx.reply('ከላይ ቢንጎ ጫን ወይም ከታች ቁልፎችን ተጠቀም።', getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('ዋጋ መምረጥ አልተሳካም።');
+    ctx.reply('ዋጋ መምረጥ አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
@@ -155,9 +172,9 @@ bot.command('leader_board', async (ctx) => {
     rows.forEach((row, index) => {
       message += `${index + 1}. ${row.username} - ${row.main_balance} ETB\n`;
     });
-    ctx.reply(message);
+    ctx.reply(message, getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('መሪዎችን ማመጣት አልተሳካም።');
+    ctx.reply('መሪዎችን ማመጣት አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
@@ -168,32 +185,32 @@ bot.hears('🏆 መሪዎች ዝርዝር', async (ctx) => {
     rows.forEach((row, index) => {
       message += `${index + 1}. ${row.username} - ${row.main_balance} ETB\n`;
     });
-    ctx.reply(message);
+    ctx.reply(message, getMainKeyboard(ctx.from.id));
   } catch (error) {
-    ctx.reply('መሪዎችን ማመጣት አልተሳካም።');
+    ctx.reply('መሪዎችን ማመጣት አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 });
 
 bot.command('deposit', (ctx) => {
-  if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገቡ።');
+  if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።');
   resetWithdrawFlow(ctx);
   ctx.session = { ...ctx.session, depositStep: 'amount' };
-  ctx.reply('💳 ገንዘብ ማስገቢያ\n\nማስገባት የምትፈልገውን መጠን አስገባ።');
+  ctx.reply('💳 ገንዘብ መያዣ\n\nመያዣ የምትፈልገውን መጠን አስገባ።');
 });
 
 bot.hears('💳 ተቀማጭ', (ctx) => {
-  if (!ctx.state.user) return ctx.reply(' በመጀመሪያ /start ብለው ይመዝገቡ።');
+  if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
   resetWithdrawFlow(ctx);
   ctx.session = { ...ctx.session, depositStep: 'amount' };
-  ctx.reply('💳 ገንዘብ አስገባ\n\nማስገባት የምትፈልገውን መጠን አስገባ።');
+  ctx.reply('💳 ገንዘብ መያዣ\n\nመያዣ የምትፈልገውን መጠን አስገባ።', getMainKeyboard(ctx.from.id));
 });
 
 // Handle screenshot uploads for deposits
 bot.on('photo', async (ctx) => {
   try {
-    if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገቡ።');
+    if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
     if (!ctx.session || ctx.session.depositStep !== 'screenshot') {
-      return ctx.reply('እባክህ መጀመሪያ የገንዘብ ማስገቢያ ለመጀመር የ 💳 ገንዘብ አስገባን ተጫን።');
+      return ctx.reply('እባክህ መጀመሪያ የመያዣ ሂደትን ለመጀመር የ 💳 ተቀማጭ አዝራርን ጫን።', getMainKeyboard(ctx.from.id));
     }
 
     const amount = ctx.session.depositAmount;
@@ -201,7 +218,7 @@ bot.on('photo', async (ctx) => {
     const fileId = photo.file_id;
     const fileUrl = await bot.telegram.getFileLink(fileId);
     
-    ctx.reply('ገንዘብ መግባቱን ማረጋገጥ በሂደት ላይ ነው...');
+    ctx.reply('የመያዣ ስክሪንሾትህን በሂደት ላይ ነው...');
 
     // Upload to Cloudinary
     const uploadResponse = await cloudinary.v2.uploader.upload(fileUrl.href, {
@@ -217,48 +234,48 @@ bot.on('photo', async (ctx) => {
     ctx.session.depositStep = null;
     ctx.session.depositAmount = null;
 
-    ctx.reply(`✅ ለ ${amount}ያስገባክበት ማረጋገጫ ተቀብለናል።\n\n📌 ሁኔታ፡ ማረጋገጫ በመጠባበቅ ላይ\n\nቡድናችን በቅርቡ ያረጋግጣል። ጥያቄው ሲፀድቅ ወይም ሲተወ ማሳወቂያ ታገኛለህ።`, getMainKeyboard(ctx.from.id));
+    ctx.reply(`✅ ለ ${amount} ብር ስክሪንሾትህን ተቀብለናል።\n\n📌 ሁኔታ፡ ማረጋገጫ በመጠባበቅ ላይ\n\nቡድናችን በቅርቡ ያረጋግጣልና ሂሳብህን ያዘምናል። ጥያቄው ሲፀድቅ ወይም ሲተወ ማሳወቂያ ታገኛለህ።`, getMainKeyboard(ctx.from.id));
   } catch (error) {
     console.error('Deposit error:', error);
-    ctx.reply('❌ ስክሪንሾትህን መላክ አልተሳካም። እባክህ እንደገና ሞክር ወይም እርዳታ ቲሙን ያነጋግሩ።');
+    ctx.reply('❌ ስክሪንሾትህን ማስኬድ አልተሳካም። እባክህ እንደገና ሞክር ወይም ድጋፍን ያነጋግር።', getMainKeyboard(ctx.from.id));
   }
 });
 
 // Withdrawal Flow
 const startWithdrawFlow = async (ctx) => {
   try {
-    if (!ctx.state.user) return ctx.reply('በመጀመሪያ /start ብለው ይመዝገብ።');
+    if (!ctx.state.user) return ctx.reply('እባክህ መጀመሪያ /start ብለህ ተመዝገብ።', getMainKeyboard(ctx.from.id));
     const [wb] = await pool.query('SELECT main_balance FROM wallets WHERE user_id=?', [ctx.state.user.id]);
     const balance = wb.length ? Number(wb[0].main_balance) : 0;
     const [pw] = await pool.query('SELECT COUNT(*) AS c FROM withdrawals WHERE user_id=? AND status="pending"', [ctx.state.user.id]);
     if (pw[0].c > 0) {
-      return ctx.reply('❌ አስቀድሞ በመመርመር ላይ ያለ ገንዘብ የማሶጣት ጥያቄ አለህ። እባክህ እስኪገባ ድረስ ተጠብቅ።');
+      return ctx.reply('❌ አስቀድሞ በመመርመር ላይ ያለ የውጣ ጥያቄ አለህ። እባክህ እስኪገባ ድረስ ተጠብቅ።', getMainKeyboard(ctx.from.id));
     }
     const minWithdrawal = 50;
     ctx.session = { ...ctx.session, withdrawStep: 'amount', balance, minWithdrawal };
-    return ctx.reply(`💸 የገንዘብ ማውጣት ጥያቄ\nየሚገኝ ሂሳብህ፡ ${balance} ብር\nአነስተኛው የማውጣት መጠን፡ ${minWithdrawal} ብር\nለመውጣት የምትፈልገውን መጠን አስገባ።`);
+    return ctx.reply(`💸 የገንዘብ ውጣ ጥያቄ\nየሚገኝ ሂሳብህ፡ ${balance} ብር\nአነስተኛው የውጣ መጠን፡ ${minWithdrawal} ብር\nለመውጣት የምትፈልገውን መጠን አስገባ።`, getMainKeyboard(ctx.from.id));
   } catch (error) {
     console.error('Withdraw command error:', error);
-    return ctx.reply('የማውጣት ሂደት መጀመር አልተሳካም።');
+    return ctx.reply('የውጣ ሂደት መጀመር አልተሳካም።', getMainKeyboard(ctx.from.id));
   }
 };
 
 bot.command('withdraw', startWithdrawFlow);
 
-bot.hears('💸 ገንዘብ አውጣ', async (ctx) => {
+bot.hears('💸 ውጣ', async (ctx) => {
   await startWithdrawFlow(ctx);
 });
 
 bot.action('withdraw_method_telebirr', async (ctx) => {
   try {
     if (!ctx.session || ctx.session.withdrawStep !== 'method') {
-      await ctx.answerCbQuery('መጀመሪያ በ "አውጣ"  የገንዘብ ማውጣት ሂደትን ጀምር።');
+      await ctx.answerCbQuery('መጀመሪያ በ "ውጣ" አዝራር የውጣ ሂደትን ጀምር።');
       return;
     }
     ctx.session.withdrawMethod = 'telebirr';
     ctx.session.withdrawStep = 'details';
     await ctx.answerCbQuery();
-    await ctx.reply('የቴሌብር ቁጥር አስገባ ገንዘቡን ለመቀበል።');
+    await ctx.reply('የተለቢር መለያ ቁጥር አስገባ ውጣውን ለመቀበል።');
   } catch {
     try { await ctx.answerCbQuery('ዘዴ መምረጥ አልተሳካም።'); } catch {}
   }
@@ -267,30 +284,41 @@ bot.action('withdraw_method_telebirr', async (ctx) => {
 bot.action('withdraw_method_cbe', async (ctx) => {
   try {
     if (!ctx.session || ctx.session.withdrawStep !== 'method') {
-      await ctx.answerCbQuery('መጀመሪያ በ "አውጣ"  የገንዘብ ማውጣት ሂደትን ጀምር።');
+      await ctx.answerCbQuery('መጀመሪያ በ "ውጣ" አዝራር የውጣ ሂደትን ጀምር።');
       return;
     }
     ctx.session.withdrawMethod = 'cbe';
-    ctx.session.withdrawStep = 'details';ቀ
+    ctx.session.withdrawStep = 'details';
     await ctx.answerCbQuery();
-    await ctx.reply('የCBE ቁጥር አስገባ ገንዘቡን ለመቀበል።');
+    await ctx.reply('የCBE መለያ ቁጥር አስገባ ውጣውን ለመቀበል።');
   } catch {
     try { await ctx.answerCbQuery('ዘዴ መምረጥ አልተሳካም።'); } catch {}
   }
 });
 
 bot.on('text', async (ctx, next) => {
-  if (!ctx.session || (!ctx.session.withdrawStep && !ctx.session.depositStep)) return next();
+  const text = (ctx.message && ctx.message.text) || '';
+  if (!ctx.session) return next();
 
-  const text = ctx.message.text;
+  // If user tapped a menu button, cancel current flow and let hears/commands handle it
+  if (MENU_BUTTON_TEXTS.has(text.trim())) {
+    delete ctx.session.depositStep;
+    delete ctx.session.depositAmount;
+    delete ctx.session.withdrawStep;
+    delete ctx.session.withdrawAmount;
+    delete ctx.session.withdrawMethod;
+    return next();
+  }
+
+  if (!ctx.session.withdrawStep && !ctx.session.depositStep) return next();
 
   if (ctx.session.withdrawStep === 'amount') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount <= 0) {
-      return ctx.reply('❌  መጠን አስገባ።');
+      return ctx.reply('❌ የተቀበለ ቁጥራዊ መጠን አስገባ።');
     }
     if (amount < ctx.session.minWithdrawal) {
-      return ctx.reply(`❌ አነስተኛው የገንዘብ መጠን ${ctx.session.minWithdrawal} ብር ነው። እባክህ ከዚህ በላይ መጠን አስገባ።`);
+      return ctx.reply(`❌ አነስተኛው የውጣ መጠን ${ctx.session.minWithdrawal} ብር ነው። እባክህ ከዚህ በላይ መጠን አስገባ።`);
     }
     if (amount > ctx.session.balance) {
       return ctx.reply(`❌ በቂ ሂሳብ የለህም። ሂሳብህ ${ctx.session.balance} ብር ነው። እባክህ ዝቅተኛ መጠን አስገባ።`);
@@ -298,7 +326,7 @@ bot.on('text', async (ctx, next) => {
 
     ctx.session.withdrawAmount = amount;
     ctx.session.withdrawStep = 'method';
-    return ctx.reply('የማውጫ ዘዴን ምረጥ፦', Markup.inlineKeyboard([
+    return ctx.reply('የውጣ ዘዴን ምረጥ፦', Markup.inlineKeyboard([
       [Markup.button.callback('Telebirr', 'withdraw_method_telebirr')],
       [Markup.button.callback('CBE', 'withdraw_method_cbe')]
     ]));
@@ -307,7 +335,7 @@ bot.on('text', async (ctx, next) => {
   if (ctx.session.depositStep === 'amount') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount < 10) {
-      return ctx.reply('❌ መጠን አስገባ (ቢያንስ 10 ብር)።');
+      return ctx.reply('❌ የተቀበለ መጠን አስገባ (ቢያንስ 10 ብር)።');
     }
     ctx.session.depositAmount = amount;
     ctx.session.depositStep = 'screenshot';
@@ -316,7 +344,7 @@ bot.on('text', async (ctx, next) => {
     const [settings] = await pool.query('SELECT k,v FROM settings');
     const sMap = {}; settings.forEach(r => sMap[r.k] = r.v);
     
-    const message = `💳 ገንዘብ አስገባ ${amount} ብር\n\n` +
+    const message = `💳 መያዣ ${amount} ብር\n\n` +
       `እባክህ ክፍያህን ወደ ከሚከተሉት መለያዎች ላክ፦\n` +
       `Telebirr: ${sMap.telebirr_number || '09XXXXXXXX'} (${sMap.telebirr_name || 'Name'})\n` +
       `CBE: ${sMap.cbe_account || '1000XXXXXXXX'} (${sMap.cbe_name || 'Name'})\n\n` +
@@ -341,7 +369,7 @@ bot.on('text', async (ctx, next) => {
         if (amount > current) {
           await conn.rollback(); conn.release();
           delete ctx.session.withdrawStep;
-          return ctx.reply('❌ በቂ ሂሳብ የለህም። የማውጣት ጥያቄው ተሰርዟል።');
+          return ctx.reply('❌ በቂ ሂሳብ የለህም። የውጣ ጥያቄው ተሰርዟል።');
         }
 
         await conn.query(
@@ -360,7 +388,7 @@ bot.on('text', async (ctx, next) => {
         delete ctx.session.withdrawStep;
         delete ctx.session.withdrawAmount;
         delete ctx.session.withdrawMethod;
-        ctx.reply(`✅ የማውጣት ጥያቄህ ተቀብሏል።\nመጠን፡ ${amount} ብር\nሁኔታ፡ ማረጋገጫ በመጠባበቅ ላይ።\nከተላከ በኋላ መልክት ይደርሰሀል።`, getMainKeyboard(ctx.from.id));
+        ctx.reply(`✅ የውጣ ጥያቄህ ተቀብሏል።\nመጠን፡ ${amount} ብር\nሁኔታ፡ ማረጋገጫ በመጠባበቅ ላይ።\nከተሰራ በኋላ ማሳወቂያ ታገኛለህ።`, getMainKeyboard(ctx.from.id));
       } catch (e) {
         await conn.rollback();
         conn.release();
@@ -368,7 +396,7 @@ bot.on('text', async (ctx, next) => {
       }
     } catch (error) {
       console.error('Withdraw processing error:', error);
-      ctx.reply('❌ የማውጣት ጥያቄህን ማስኬድ አልተሳካም። እባክህ በኋላ እንደገና ሞክር።');
+      ctx.reply('❌ የውጣ ጥያቄህን ማስኬድ አልተሳካም። እባክህ በኋላ እንደገና ሞክር።', getMainKeyboard(ctx.from.id));
     }
     return;
   }
@@ -389,16 +417,16 @@ export const sendBotNotification = async (telegramId, message) => {
 
 bot.command('invite', (ctx) => {
   const inviteLink = `https://t.me/${ctx.botInfo.username}?start=${ctx.from.id}`;
-  ctx.reply(`ወዳጆችህን ጋብዝ እና ሽልማት አግኝ! \n\nመጋበዛክ:\n${inviteLink}`);
+  ctx.reply(`ወዳጆችህን ጋብዝ እና ሽልማት አግኝ! \n\nየመጋበዣ አገናኝህ:\n${inviteLink}`, getMainKeyboard(ctx.from.id));
 });
 
 bot.hears('👥 ወዳጆችን ጋብዝ', (ctx) => {
   const inviteLink = `https://t.me/${ctx.botInfo.username}?start=${ctx.from.id}`;
-  ctx.reply(`ወዳጆችህን ጋብዝ እና ሽልማት አግኝ! \n\nመጋበዛክ:\n${inviteLink}`);
+  ctx.reply(`ወዳጆችህን ጋብዝ እና ሽልማት አግኝ! \n\nየመጋበዣ አገናኝህ:\n${inviteLink}`, getMainKeyboard(ctx.from.id));
 });
 
 bot.command('instruction', (ctx) => {
-  ctx.reply('📖 መመሪያዎች፦\n1. መወራረጃ ይምረጡ።\n2. የቢንጎ ካርድዎን ይውሰዱ።\n3. ቁጥሮች ሲጠሩ ምልክት ያድርጉ።\n4. ቀድሞ ካርዱን የሞላ ያሸንፋል!');
+  ctx.reply('📖 መመሪያዎች፦\n1. መወራረጃ ይምረጡ።\n2. የቢንጎ ካርድዎን ይውሰዱ።\n3. ቁጥሮች ሲጠሩ ምልክት ያድርጉ።\n4. ቀድሞ ካርዱን የሞላ ያሸንፋል!', getMainKeyboard(ctx.from.id));
 });
 
 bot.hears('ℹ️ መመሪያ', (ctx) => {
@@ -406,19 +434,19 @@ bot.hears('ℹ️ መመሪያ', (ctx) => {
 });
 
 bot.command('game_pattern', (ctx) => {
-  ctx.reply('🏁 የጨዋታ ዘዴዎች፦\n- አግድም መስመር (Horizontal)\n- ቁልቁል መስመር (Vertical)\n- የአግድም መስመር (Diagonal)\n- አራቱም ማእዘኖች\n- ሙሉ ካርድ (Full house)');
+  ctx.reply('🏁 የጨዋታ ዘዴዎች፦\n- አግድም መስመር (Horizontal)\n- ቁልቁል መስመር (Vertical)\n- የአግድም መስመር (Diagonal)\n- አራቱም ማእዘኖች\n- ሙሉ ካርድ (Full house)', getMainKeyboard(ctx.from.id));
 });
 
 bot.hears('🏁 የጨዋታ አቀማመጦች', (ctx) => {
-  ctx.reply('🏁 የጨዋታ ዘዴሆች፦\n- አግድም መስመር (Horizontal)\n- ቁልቁል መስመር (Vertical)\n- አግድም ስላሽ (Diagonal)');
+  ctx.reply('🏁 የጨዋታ ዘዴሆች፦\n- አግድም መስመር (Horizontal)\n- ቁልቁል መስመር (Vertical)\n- አግድም መስመር (Diagonal)\n- አራቱም ማእዘኖች\n- ሙሉ ካርድ (Full house)', getMainKeyboard(ctx.from.id));
 });
 
 bot.command('support', (ctx) => {
-    ctx.reply('📞 ድጋፍ ለማግኘት፦ @BingoSupportBot ያነጋግሩ ወይም በ support@bingoapp.com ኢሜይል ያድርጉልን');
+  ctx.reply('📞 ድጋፍ ለማግኘት፦ @BingoSupportBot ያነጋግሩ ወይም በ support@bingoapp.com ኢሜይል ያድርጉልን', getMainKeyboard(ctx.from.id));
 });
 
 bot.hears('📞 ድጋፍ', (ctx) => {
-  ctx.reply('📞 ድጋፍ ለማግኘት፦ @BingoSupportBot ያነጋግሩ ወይም በ support@bingoapp.com ኢሜይል ያድርጉልን');
+  ctx.reply('📞 ድጋፍ ለማግኘት፦ @BingoSupportBot ያነጋግሩ ወይም በ support@bingoapp.com ኢሜይል ያድርጉልን', getMainKeyboard(ctx.from.id));
 });
 
 export default bot;
