@@ -1,0 +1,141 @@
+import express from 'express';
+import bcrypt from 'bcrypt';
+import { pool } from '../db.js';
+import { signToken } from '../utils/jwt.js';
+
+const router = express.Router();
+
+const validateEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+const validatePassword = (password) => /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$/.test(password);
+
+// Simple brute-force limiter per username/email in memory
+const loginAttempts = new Map();
+const MAX_ATTEMPTS = 5;
+const WINDOW_MS = 15 * 60 * 1000;
+
+const recordAttempt = (key, ok) => {
+  const now = Date.now();
+  const entry = loginAttempts.get(key) || { count: 0, first: now };
+  if (now - entry.first > WINDOW_MS) {
+    loginAttempts.set(key, { count: ok ? 0 : 1, first: now });
+    return;
+  }
+  entry.count = ok ? 0 : entry.count + 1;
+  loginAttempts.set(key, entry);
+};
+
+const blocked = (key) => {
+  const entry = loginAttempts.get(key);
+  if (!entry) return false;
+  const now = Date.now();
+  if (now - entry.first > WINDOW_MS) return false;
+  return entry.count >= MAX_ATTEMPTS;
+};
+
+// Register
+router.post('/register', async (req, res) => {
+  try {
+    const { email, username, password, name, avatar, playerId } = req.body || {};
+    if (!username && !email) return res.status(400).json({ success: false, message: 'Email or username required' });
+    if (!password || !validatePassword(password)) return res.status(400).json({ success: false, message: 'Weak password: min 8 chars, letters and numbers' });
+    if (email && !validateEmail(email)) return res.status(400).json({ success: false, message: 'Invalid email' });
+
+    // Check uniqueness
+    const [uRows] = await pool.query('SELECT id FROM users WHERE username = ?', [username]);
+    if (username && uRows.length) return res.status(409).json({ success: false, message: 'Username already exists' });
+    const [pRows] = await pool.query('SELECT id FROM user_profiles WHERE email = ?', [email]);
+    if (email && pRows.length) return res.status(409).json({ success: false, message: 'Email already registered' });
+
+    if (email) {
+      const [banEmailRows] = await pool.query(
+        'SELECT u.id FROM users u JOIN user_profiles p ON p.user_id=u.id WHERE p.email=? AND u.banned_until IS NOT NULL AND u.banned_until > NOW()',
+        [email]
+      );
+      if (banEmailRows.length) {
+        return res.status(403).json({ success: false, message: 'Registration blocked: email is banned' });
+      }
+    }
+    if (playerId) {
+      const [banDeviceRows] = await pool.query(
+        'SELECT u.id FROM users u JOIN user_profiles p ON p.user_id=u.id WHERE p.player_id=? AND u.banned_until IS NOT NULL AND u.banned_until > NOW()',
+        [playerId]
+      );
+      if (banDeviceRows.length) {
+        return res.status(403).json({ success: false, message: 'Registration blocked: device is banned' });
+      }
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    const [uRes] = await pool.query('INSERT INTO users (username, password) VALUES (?, ?)', [username || email, hashed]);
+    const userId = uRes.insertId;
+    await pool.query('INSERT INTO user_profiles (user_id, email, name, avatar, player_id) VALUES (?, ?, ?, ?, ?)', [userId, email || null, name || null, avatar || null, playerId || null]);
+
+    // Issue token
+    const token = signToken({ id: userId, username: username || email });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: false, maxAge: 2 * 60 * 60 * 1000 });
+    return res.json({ success: true, message: 'Registration successful', userId, username: username || email });
+  } catch (e) {
+    console.error('Register error:', e);
+    return res.status(500).json({ success: false, message: 'Registration failed' });
+  }
+});
+
+// Login (email or username)
+router.post('/login', async (req, res) => {
+  try {
+    const { identifier, password } = req.body || {};
+    if (!identifier || !password) return res.status(400).json({ success: false, message: 'Identifier and password required' });
+    if (blocked(identifier)) return res.status(429).json({ success: false, message: 'Too many attempts, try later' });
+
+    // Find by username first, then email via profile
+    const [uRows] = await pool.query('SELECT * FROM users WHERE username = ?', [identifier]);
+    let user = uRows[0];
+    if (!user) {
+      const [pRows] = await pool.query('SELECT user_id FROM user_profiles WHERE email = ?', [identifier]);
+      if (pRows.length) {
+        const userId = pRows[0].user_id;
+        const [uById] = await pool.query('SELECT * FROM users WHERE id = ?', [userId]);
+        user = uById[0];
+      }
+    }
+
+    if (!user) {
+      recordAttempt(identifier, false);
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) {
+      recordAttempt(identifier, false);
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    const deactivated = Number(user.deactivated || 0) === 1;
+    const bannedUntil = user.banned_until ? new Date(user.banned_until) : null;
+    const isBanned = bannedUntil && bannedUntil.getTime() > Date.now();
+    if (deactivated) {
+      recordAttempt(identifier, true);
+      return res.status(403).json({ success: false, message: 'Account is deactivated. Contact support.' });
+    }
+    if (isBanned) {
+      recordAttempt(identifier, true);
+      return res.status(403).json({ success: false, message: 'Account is banned.' });
+    }
+
+    recordAttempt(identifier, true);
+    const token = signToken({ id: user.id, username: user.username });
+    res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: false, maxAge: 2 * 60 * 60 * 1000 });
+    return res.json({ success: true, message: 'Login successful', userId: user.id, username: user.username });
+  } catch (e) {
+    console.error('Login error:', e);
+    return res.status(500).json({ success: false, message: 'Login failed' });
+  }
+});
+
+router.post('/logout', async (req, res) => {
+  res.clearCookie('token');
+  res.json({ success: true, message: 'Logged out' });
+});
+
+export default router;
+
