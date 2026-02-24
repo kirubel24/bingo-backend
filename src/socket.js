@@ -187,6 +187,7 @@ export const initSocket = (io) => {
       try {
         const games = getAllGames();
         for (const [gid, g] of Object.entries(games)) {
+          // Remove from current round players
           const idx = g.players.findIndex((p) => p?.player?.socketId === socket.id);
           if (idx >= 0) {
             const freedCardId = g.players[idx].cardId;
@@ -194,6 +195,8 @@ export const initSocket = (io) => {
             const oldCard = cards.find((c) => c.cardId === freedCardId);
             if (oldCard) oldCard.taken = false;
             g.players.splice(idx, 1);
+
+            // Handle round ending if no one left
             if (g.started && g.players.length === 0) {
               try {
                 if (g.graceTimer) { clearInterval(g.graceTimer); g.graceTimer = null; }
@@ -202,8 +205,30 @@ export const initSocket = (io) => {
                 io.to(gid).emit("game_end", { participantUserIds: pIds });
               } catch {}
               resetToLobby(io, gid);
-              continue;
+              continue; // Next game
             }
+            
+            // Handle lobby countdown stopping if fewer than 2 players
+            if (!g.started && g.players.length < 2 && g.timer) {
+              clearInterval(g.timer);
+              g.timer = null;
+              const firstRemaining = g.players[0];
+              if (firstRemaining?.player?.socketId) {
+                io.to(firstRemaining.player.socketId).emit("need_more_players");
+              }
+            }
+
+            io.to(gid).emit("all_cards", getAllCards(gid));
+          }
+
+          // Remove from next round selections if queued
+          const idxNext = g.nextRoundSelections ? g.nextRoundSelections.findIndex((p) => p?.player?.socketId === socket.id) : -1;
+          if (idxNext >= 0) {
+            const freedCardId = g.nextRoundSelections[idxNext].cardId;
+            const cards = getAllCards(gid);
+            const oldCard = cards.find((c) => c.cardId === freedCardId);
+            if (oldCard) oldCard.taken = false;
+            g.nextRoundSelections.splice(idxNext, 1);
             io.to(gid).emit("all_cards", getAllCards(gid));
           }
         }
@@ -323,7 +348,6 @@ const resetToLobby = async (io, gameId) => {
   }
 
   io.to(gameId).emit("new_game_ready");
-  io.socketsLeave(gameId);
   broadcastAdminStats(io);
 };
 
