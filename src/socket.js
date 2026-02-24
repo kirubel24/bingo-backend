@@ -194,6 +194,16 @@ export const initSocket = (io) => {
             const oldCard = cards.find((c) => c.cardId === freedCardId);
             if (oldCard) oldCard.taken = false;
             g.players.splice(idx, 1);
+            if (g.started && g.players.length === 0) {
+              try {
+                if (g.graceTimer) { clearInterval(g.graceTimer); g.graceTimer = null; }
+                if (g.drawTimer) { clearInterval(g.drawTimer); g.drawTimer = null; }
+                const pIds = (g.settlementParticipants || []).map((p) => p.player.id);
+                io.to(gid).emit("game_end", { participantUserIds: pIds });
+              } catch {}
+              resetToLobby(io, gid);
+              continue;
+            }
             io.to(gid).emit("all_cards", getAllCards(gid));
           }
         }
