@@ -190,10 +190,12 @@ const io = new Server(server, {
 initSocket(io);
 
 // Start Telegram Bot
-if (process.env.TELEGRAM_BOT_TOKEN) {
+if (process.env.TELEGRAM_BOT_TOKEN && process.env.DISABLE_TELEGRAM_BOT !== 'true') {
   bot.launch()
     .then(() => console.log('🤖 Telegram Bot started'))
     .catch((err) => console.error('❌ Failed to start Telegram Bot:', err));
+} else if (process.env.DISABLE_TELEGRAM_BOT === 'true') {
+  console.log('🤖 Telegram Bot is disabled (DISABLE_TELEGRAM_BOT=true)');
 } else {
   console.warn('⚠️ TELEGRAM_BOT_TOKEN not found, bot not started');
 }
