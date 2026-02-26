@@ -1,5 +1,4 @@
 // src/db.js
-import 'dotenv/config';
 import mysql from 'mysql2/promise';
 
 const host = process.env.DB_HOST || process.env.MYSQLHOST || process.env.MYSQL_HOST;
