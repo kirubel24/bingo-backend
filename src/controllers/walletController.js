@@ -237,7 +237,11 @@ export const applyStakeRefund = async (req, res) => {
         const { getGame } = await import('../services/gameService.js')
         const g = getGame(String(room_id))
         if (g && g.started) {
-          return res.status(409).json({ success: false, message: 'Game already started' })
+          // If game started, only block refund if this specific user is actually in the current round
+          const isPlaying = g.players && g.players.some(p => String(p.player.id) === String(userId))
+          if (isPlaying) {
+            return res.status(409).json({ success: false, message: 'Game already started and you are participating' })
+          }
         }
       } catch {}
     }

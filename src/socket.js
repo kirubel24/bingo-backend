@@ -31,6 +31,12 @@ export const initSocket = (io) => {
           return;
         }
         socket.join(roomId);
+        if (game.started) {
+          socket.emit("game_start", { 
+            participantUserIds: (game.settlementParticipants || []).map(p => p.player.id),
+            calledNumbers: game.calledNumbers || []
+          });
+        }
         broadcastAdminStats(io);
       } catch {}
     });
