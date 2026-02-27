@@ -1,5 +1,5 @@
 import { joinGameWithCard, getGame, startGame, createGame, drawAndStoreNumber, clearGameNumbers, getAllGames } from "./services/gameService.js";
-import { selectCard, getAllCards, resetAllCards } from "./services/cardService.js";
+import { selectCard, getAllCards, resetAllCards, releaseCard, rotateCardsToNewRound } from "./services/cardService.js";
 import { checkBingo } from "./utils/bingoLogic.js";
 import { handleRegister, handleLogin, handleGetCard, handleGetAvailableCards, handleSelectCard } from "./controllers/userController.js";
 import { getUserFromSocket } from './middleware/auth.js'
@@ -9,6 +9,41 @@ import { setIo } from "./socketRef.js";
 const LOBBY_COUNTDOWN = 15; // seconds
 const GRACE_PERIOD_SECONDS = 10; // allow post-draw marking
 const NEXT_GAME_DELAY = 0; // start next round immediately
+
+/* ---------------------------------------------------------- */
+/*                  REFUND HELPER                             */
+/* ---------------------------------------------------------- */
+
+const performRefund = async (uid, rid, amt, name) => {
+  if (!uid || !rid || !amt) return;
+  console.log(`💸 Refunding ${name || uid} (Amt: ${amt}, Round: ${rid})...`);
+  try {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Check if already refunded to prevent double refund
+      const [existing] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="refund" AND reference=? LIMIT 1', [uid, rid]);
+      if (existing.length === 0) {
+        // Verify a stake actually exists for this round to avoid arbitrary balance increases
+        const [stake] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [uid, rid]);
+        if (stake.length > 0) {
+          await conn.query('UPDATE wallets SET main_balance=main_balance+? WHERE user_id=?', [amt, uid]);
+          await conn.query('INSERT INTO transactions (user_id, type, amount, method, reference, status) VALUES (?, "adjustment", ?, "refund", ?, "success")', [uid, amt, rid]);
+        } else {
+          console.warn(`⚠️ No stake found for refund: User ${uid}, Round ${rid}`);
+        }
+      }
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      console.error("Refund transaction error:", e);
+    } finally {
+      conn.release();
+    }
+  } catch (e) {
+    console.error("Database connection error for refund:", e);
+  }
+};
 
 export const initSocket = (io) => {
   setIo(io);
@@ -49,7 +84,7 @@ export const initSocket = (io) => {
     });
 
     // ✅ Player selects a card (can change before game starts)
-    socket.on("select_card", async ({ gameId, cardId, user, stake }) => {
+    socket.on("select_card", async ({ gameId, cardId, user, stake, roundId }) => {
       const roomId = String(gameId)
       const gate = await ensurePlayAllowed(socket, user?.id)
       if (!gate.ok) { socket.emit('access_denied', { message: gate.message }); return }
@@ -68,26 +103,33 @@ export const initSocket = (io) => {
       const existingNext = game.nextRoundSelections && game.nextRoundSelections.find((p) => p.player.id === user.id);
       const existingEntry = existing || existingNext;
       if (existingEntry) {
-        const oldList = getAllCards(roomId);
-        const oldCard = oldList.find((c) => c.cardId === existingEntry.cardId);
-        if (oldCard) oldCard.taken = false;
+        // Release card for the round they are currently associated with
+        releaseCard(roomId, existingEntry.cardId, !!existingNext);
         if (existing) game.players = game.players.filter((p) => p.player.id !== user.id);
         if (existingNext) game.nextRoundSelections = game.nextRoundSelections.filter((p) => p.player.id !== user.id);
       }
 
       // Try to take the new card
-      const selected = selectCard(roomId, cardId, user);
+      // If round is running, we select for the NEXT round.
+      const isNext = !!game.started;
+      
+      // Force unique check: a player can only have ONE selection (current or next)
+      // This is already handled by the releaseCard logic above, but let's be explicit
+      const selected = selectCard(roomId, cardId, user, isNext);
+      
       if (selected && selected.player) {
         selected.player.socketId = socket.id;
+        // Keep track of stake info for auto-refunds
+        selected.player.stake = Number(stake || game.stake || 0);
+        selected.player.roundId = String(roundId || ''); 
       }
       if (!selected) {
         socket.emit("card_taken", { cardId });
         return;
       }
 
-      // Re-check started before adding (closes race: round may have started during async/processing)
-      if (game.started) {
-        // Round already running: add to next-round queue so they can play next round; do not add to current round
+      if (isNext) {
+        // Round already running: add to next-round queue
         if (!game.nextRoundSelections) game.nextRoundSelections = [];
         game.nextRoundSelections.push(selected);
         socket.join(roomId);
@@ -188,7 +230,7 @@ export const initSocket = (io) => {
       }
     });
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
       console.log(`🔴 Client disconnected: ${socket.id}`);
       try {
         const games = getAllGames();
@@ -196,7 +238,16 @@ export const initSocket = (io) => {
           // Remove from current round players
           const idx = g.players.findIndex((p) => p?.player?.socketId === socket.id);
           if (idx >= 0) {
-            const freedCardId = g.players[idx].cardId;
+            const playerToRemove = g.players[idx];
+            const freedCardId = playerToRemove.cardId;
+            
+            // AUTO-REFUND if game hasn't started OR they weren't in the participant list (late joiner)
+            const isParticipant = g.settlementParticipants && g.settlementParticipants.some(p => String(p.player.id) === String(playerToRemove.player.id));
+            if (!g.started || !isParticipant) {
+              const { id, roundId, stake, name } = playerToRemove.player || {};
+              performRefund(id, roundId, stake, name);
+            }
+
             const cards = getAllCards(gid);
             const oldCard = cards.find((c) => c.cardId === freedCardId);
             if (oldCard) oldCard.taken = false;
@@ -230,10 +281,16 @@ export const initSocket = (io) => {
           // Remove from next round selections if queued
           const idxNext = g.nextRoundSelections ? g.nextRoundSelections.findIndex((p) => p?.player?.socketId === socket.id) : -1;
           if (idxNext >= 0) {
-            const freedCardId = g.nextRoundSelections[idxNext].cardId;
+            const playerToRemove = g.nextRoundSelections[idxNext];
+            const freedCardId = playerToRemove.cardId;
+
+            // AUTO-REFUND for next round reservation if they disconnect
+            const { id, roundId, stake, name } = playerToRemove.player || {};
+            performRefund(id, roundId, stake, name);
+
             const cards = getAllCards(gid);
             const oldCard = cards.find((c) => c.cardId === freedCardId);
-            if (oldCard) oldCard.taken = false;
+            if (oldCard) oldCard.takenNext = false; // Note: for next round it's takenNext
             g.nextRoundSelections.splice(idxNext, 1);
             io.to(gid).emit("all_cards", getAllCards(gid));
           }
@@ -254,8 +311,13 @@ export const initSocket = (io) => {
           const nextEntry = game.nextRoundSelections && game.nextRoundSelections.find((p) => p.player.id === userId);
           if (nextEntry) {
             const oldCard = getAllCards(roomId).find((c) => c.cardId === nextEntry.cardId);
-            if (oldCard) oldCard.taken = false;
+            if (oldCard) oldCard.takenNext = false;
             game.nextRoundSelections = game.nextRoundSelections.filter((p) => p.player.id !== userId);
+            
+            // REFUND for next round reservation
+            const { id, roundId, stake, name } = nextEntry.player || {};
+            performRefund(id, roundId, stake, name);
+
             io.to(roomId).emit("all_cards", getAllCards(roomId));
             broadcastAdminStats(io);
           }
@@ -268,6 +330,10 @@ export const initSocket = (io) => {
             const oldCard = getAllCards(roomId).find((c) => c.cardId === playerEntry.cardId);
             if (oldCard) oldCard.taken = false;
             game.players = game.players.filter((p) => p.player.id !== userId);
+            
+            // REFUND for lobby selection
+            const { id, roundId, stake, name } = playerEntry.player || {};
+            performRefund(id, roundId, stake, name);
           }
           try { socket.leave(roomId); } catch {}
           socket.emit("you_cancelled_game");
@@ -332,12 +398,10 @@ const resetToLobby = async (io, gameId) => {
 
   await clearGameNumbers(gameId);
 
-  // Free only current round players' cards (not next-round selections)
-  const cards = getAllCards(gameId);
-  for (const p of game.players) {
-    const c = cards.find((x) => x.cardId === p.cardId);
-    if (c) c.taken = false;
-  }
+  // Rotate card availability: nextRoundSelections now become current round players,
+  // and their cards are officially 'taken' for the new round.
+  rotateCardsToNewRound(gameId);
+
   game.players = [];
   game.settlementParticipants = [];
 
@@ -354,6 +418,7 @@ const resetToLobby = async (io, gameId) => {
   }
 
   io.to(gameId).emit("new_game_ready");
+  io.to(gameId).emit("all_cards", getAllCards(gameId));
   broadcastAdminStats(io);
 };
 
