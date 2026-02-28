@@ -4,7 +4,7 @@ import { checkBingo } from "./utils/bingoLogic.js";
 import { handleRegister, handleLogin, handleGetCard, handleGetAvailableCards, handleSelectCard } from "./controllers/userController.js";
 import { getUserFromSocket } from './middleware/auth.js'
 import { pool } from './db.js'
-import { setIo } from "./socketRef.js";
+import { setIo, getIo } from "./socketRef.js";
 
 const LOBBY_COUNTDOWN = 15; // seconds
 const GRACE_PERIOD_SECONDS = 10; // allow post-draw marking
@@ -14,24 +14,85 @@ const NEXT_GAME_DELAY = 0; // start next round immediately
 /*                  REFUND HELPER                             */
 /* ---------------------------------------------------------- */
 
-const performRefund = async (uid, rid, amt, name) => {
-  if (!uid || !rid || !amt) return;
-  console.log(`💸 Refunding ${name || uid} (Amt: ${amt}, Round: ${rid})...`);
+/* ---------------------------------------------------------- */
+/*                  UTILITIES                                 */
+/* ---------------------------------------------------------- */
+
+const findUserSocketId = (userId) => {
+  const games = getAllGames();
+  for (const g of Object.values(games)) {
+    // Check current players
+    const p = g.players.find(player => String(player.player.id) === String(userId));
+    if (p?.player?.socketId) return p.player.socketId;
+    
+    // Check next round players
+    const nextP = g.nextRoundSelections && g.nextRoundSelections.find(player => String(player.player.id) === String(userId));
+    if (nextP?.player?.socketId) return nextP.player.socketId;
+  }
+  return null;
+};
+
+const performRefund = async (uid, rid, amt, name, socketId = null) => {
+  if (!uid || !amt) return;
+  // If rid is missing, we'll try to find the latest stake for this user
+  console.log(`💸 Attempting refund for ${name || uid} (Amt: ${amt}, Round: ${rid || 'LATEST'})...`);
   try {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      // Check if already refunded to prevent double refund
-      const [existing] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="refund" AND reference=? LIMIT 1', [uid, rid]);
+      
+      let finalRid = rid;
+      
+      // If roundId is missing, find the most recent 'stake' transaction for this user that hasn't been refunded
+      if (!finalRid) {
+        const [latestStake] = await conn.query(
+          `SELECT reference FROM transactions 
+           WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid")
+           AND reference IS NOT NULL
+           AND reference NOT IN (
+             SELECT reference FROM transactions 
+             WHERE user_id=? AND type="adjustment" AND method="refund" AND status="success"
+             AND reference IS NOT NULL
+           )
+           ORDER BY created_at DESC LIMIT 1`,
+          [uid, uid]
+        );
+        
+        if (latestStake.length > 0) {
+          finalRid = latestStake[0].reference;
+          console.log(`🔍 Found latest unrefunded stake roundId: ${finalRid}`);
+        }
+      }
+
+      if (!finalRid) {
+        console.warn(`⚠️ Could not determine roundId for refund: User ${uid}`);
+        await conn.rollback();
+        return;
+      }
+
+      // Check if already refunded
+      const [existing] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="refund" AND status="success" AND reference=? LIMIT 1 FOR UPDATE', [uid, finalRid]);
       if (existing.length === 0) {
-        // Verify a stake actually exists for this round to avoid arbitrary balance increases
-        const [stake] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [uid, rid]);
+        // Double check stake exists
+        const [stake] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [uid, finalRid]);
         if (stake.length > 0) {
           await conn.query('UPDATE wallets SET main_balance=main_balance+? WHERE user_id=?', [amt, uid]);
-          await conn.query('INSERT INTO transactions (user_id, type, amount, method, reference, status) VALUES (?, "adjustment", ?, "refund", ?, "success")', [uid, amt, rid]);
+          await conn.query('INSERT INTO transactions (user_id, type, amount, method, reference, status) VALUES (?, "adjustment", ?, "refund", ?, "success")', [uid, amt, finalRid]);
+          console.log(`✅ Refund successful for ${name || uid}: ${amt} ETB (Round: ${finalRid})`);
+          
+          // Emit real-time balance update to the player if they are connected
+          const io = getIo();
+          if (io) {
+            const sid = socketId || findUserSocketId(uid);
+            if (sid) {
+              io.to(sid).emit('balance_update');
+            }
+          }
         } else {
-          console.warn(`⚠️ No stake found for refund: User ${uid}, Round ${rid}`);
+          console.warn(`⚠️ No stake found for refund: User ${uid}, Round ${finalRid}`);
         }
+      } else {
+        console.log(`ℹ️ Refund already processed for User ${uid}, Round ${finalRid}`);
       }
       await conn.commit();
     } catch (e) {
@@ -102,7 +163,15 @@ export const initSocket = (io) => {
       const existing = game.players.find((p) => p.player.id === user.id);
       const existingNext = game.nextRoundSelections && game.nextRoundSelections.find((p) => p.player.id === user.id);
       const existingEntry = existing || existingNext;
+      
+      // If player is swapping cards, we don't refund yet, just move the stake to the new card
+      let existingStake = 0;
+      let existingRoundId = '';
+      
       if (existingEntry) {
+        existingStake = Number(existingEntry.player.stake || 0);
+        existingRoundId = existingEntry.player.roundId || '';
+        
         // Release card for the round they are currently associated with
         releaseCard(roomId, existingEntry.cardId, !!existingNext);
         if (existing) game.players = game.players.filter((p) => p.player.id !== user.id);
@@ -120,8 +189,9 @@ export const initSocket = (io) => {
       if (selected && selected.player) {
         selected.player.socketId = socket.id;
         // Keep track of stake info for auto-refunds
-        selected.player.stake = Number(stake || game.stake || 0);
-        selected.player.roundId = String(roundId || ''); 
+        // Use existing stake if they are just swapping cards, otherwise use the new stake provided
+        selected.player.stake = Number(stake || existingStake || game.stake || 0);
+        selected.player.roundId = String(roundId || existingRoundId || ''); 
       }
       if (!selected) {
         socket.emit("card_taken", { cardId });
@@ -207,6 +277,7 @@ export const initSocket = (io) => {
         const commission = poolTotal - winnerReward;
         io.to(roomId).emit("payouts", { poolTotal, winnerReward, commission, winnerId: userId });
         io.to(roomId).emit("game_end", { participantUserIds: participants.map((p) => p.player.id) });
+        io.to(roomId).emit("balance_update"); // Refresh everyone's balance (winner reward, etc.)
         console.log(`🏆 ${player.player.name} won the Bingo!`);
 
         // Stop any grace countdown if active
@@ -245,7 +316,8 @@ export const initSocket = (io) => {
             const isParticipant = g.settlementParticipants && g.settlementParticipants.some(p => String(p.player.id) === String(playerToRemove.player.id));
             if (!g.started || !isParticipant) {
               const { id, roundId, stake, name } = playerToRemove.player || {};
-              performRefund(id, roundId, stake, name);
+              console.log(`👋 ${name || id} disconnected. Processing refund...`);
+              await performRefund(id, roundId, stake, name, socket.id);
             }
 
             const cards = getAllCards(gid);
@@ -286,7 +358,7 @@ export const initSocket = (io) => {
 
             // AUTO-REFUND for next round reservation if they disconnect
             const { id, roundId, stake, name } = playerToRemove.player || {};
-            performRefund(id, roundId, stake, name);
+            await performRefund(id, roundId, stake, name, socket.id);
 
             const cards = getAllCards(gid);
             const oldCard = cards.find((c) => c.cardId === freedCardId);
@@ -300,7 +372,7 @@ export const initSocket = (io) => {
     });
 
     // Player cancels (free their card, update lobby; or remove from next-round list if round is running)
-    socket.on("cancel_game", ({ gameId, userId }) => {
+    socket.on("cancel_game", async ({ gameId, userId }) => {
       const roomId = String(gameId)
       const game = getGame(roomId) || createGame(roomId);
       if (!game) return;
@@ -316,7 +388,7 @@ export const initSocket = (io) => {
             
             // REFUND for next round reservation
             const { id, roundId, stake, name } = nextEntry.player || {};
-            performRefund(id, roundId, stake, name);
+            await performRefund(id, roundId, stake, name, socket.id);
 
             io.to(roomId).emit("all_cards", getAllCards(roomId));
             broadcastAdminStats(io);
@@ -333,7 +405,7 @@ export const initSocket = (io) => {
             
             // REFUND for lobby selection
             const { id, roundId, stake, name } = playerEntry.player || {};
-            performRefund(id, roundId, stake, name);
+            await performRefund(id, roundId, stake, name, socket.id);
           }
           try { socket.leave(roomId); } catch {}
           socket.emit("you_cancelled_game");

@@ -222,35 +222,54 @@ export const applyStakeRefund = async (req, res) => {
     const { amount, round_id, room_id } = req.body || {}
     const amt = Number(amount)
     if (!amt || amt <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' })
-    if (round_id) {
-      const [refExisting] = await pool.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="refund" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [userId, String(round_id)])
-      if (refExisting.length) {
-        return res.json({ success: true })
-      }
-      const [stakeExisting] = await pool.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [userId, String(round_id)])
-      if (!stakeExisting.length) {
-        return res.status(400).json({ success: false, message: 'No stake found for round' })
-      }
-    }
-    if (room_id != null) {
-      try {
-        const { getGame } = await import('../services/gameService.js')
-        const g = getGame(String(room_id))
-        if (g && g.started) {
-          // If game started, only block refund if this specific user is actually in the current round
-          const isPlaying = g.players && g.players.some(p => String(p.player.id) === String(userId))
-          if (isPlaying) {
-            return res.status(409).json({ success: false, message: 'Game already started and you are participating' })
-          }
+    
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+      
+      if (round_id) {
+        // Use FOR UPDATE to lock these rows and prevent concurrent refunds
+        const [refExisting] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="refund" AND status IN ("success","approved","paid") AND reference=? LIMIT 1 FOR UPDATE', [userId, String(round_id)])
+        if (refExisting.length) {
+          await conn.rollback(); conn.release()
+          return res.json({ success: true })
         }
-      } catch {}
+        
+        const [stakeExisting] = await conn.query('SELECT id FROM transactions WHERE user_id=? AND type="adjustment" AND method="stake" AND status IN ("success","approved","paid") AND reference=? LIMIT 1', [userId, String(round_id)])
+        if (!stakeExisting.length) {
+          await conn.rollback(); conn.release()
+          return res.status(400).json({ success: false, message: 'No stake found for round' })
+        }
+      }
+      
+      if (room_id != null) {
+        try {
+          const { getGame } = await import('../services/gameService.js')
+          const g = getGame(String(room_id))
+          if (g && g.started) {
+            // If game started, only block refund if this specific user is actually in the current round
+            const isPlaying = g.players && g.players.some(p => String(p.player.id) === String(userId))
+            if (isPlaying) {
+              await conn.rollback(); conn.release()
+              return res.status(409).json({ success: false, message: 'Game already started and you are participating' })
+            }
+          }
+        } catch {}
+      }
+      
+      const [r] = await conn.query('UPDATE wallets SET main_balance=main_balance+? WHERE user_id=?', [amt, userId])
+      if (!r.affectedRows) {
+        await conn.query('INSERT INTO wallets (user_id, main_balance, bonus_balance) VALUES (?,?,0)', [userId, amt])
+      }
+      await conn.query('INSERT INTO transactions (user_id, type, amount, method, reference, status) VALUES (?,?,?,?,?,"success")', [userId, 'adjustment', amt, 'refund', round_id || null])
+      
+      await conn.commit(); conn.release()
+      res.json({ success: true })
+    } catch (e) {
+      try { await conn.rollback() } catch {}
+      conn.release()
+      throw e
     }
-    const [r] = await pool.query('UPDATE wallets SET main_balance=main_balance+? WHERE user_id=?', [amt, userId])
-    if (!r.affectedRows) {
-      await pool.query('INSERT INTO wallets (user_id, main_balance, bonus_balance) VALUES (?,?,0)', [userId, amt])
-    }
-    await pool.query('INSERT INTO transactions (user_id, type, amount, method, reference, status) VALUES (?,?,?,?,?,"success")', [userId, 'adjustment', amt, 'refund', round_id || null])
-    res.json({ success: true })
   } catch (e) { res.status(500).json({ success: false, message: e.message }) }
 }
 
